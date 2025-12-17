@@ -1,0 +1,301 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import scipy.io
+from tqdm import tqdm
+
+# 配置参数
+BATCH_SIZE = 32
+EPOCHS = 100
+BASE_PATH = '/home/jturley1/gokhale_user/675/project/'
+
+# 加载数据
+otfs_data = scipy.io.loadmat(BASE_PATH + 'data/OTFSData.mat')
+Tdata = otfs_data['Tdata']  # 传输数据
+Rx = otfs_data['Rx']        # 接收数据
+
+# 划分训练集和测试集
+n = Rx.shape[0]
+indices = np.arange(n)
+train_indices, test_indices = train_test_split(indices, test_size=0.2, shuffle=True, random_state=42)
+
+# ============================================================================
+# MSE版本的数据集类
+# ============================================================================
+class SymbolDemodulationDatasetMSE(Dataset):
+    def __init__(self, otfs_data, indices, channelEstimationModel=None, ceDiscrete=False):
+        """
+        MSE版本的数据集类，用于符号解调任务
+        
+        参数:
+        - otfs_data: 包含OTFS数据的字典
+        - indices: 要使用的数据索引列表
+        - channelEstimationModel: 信道估计模型（可选）
+        - ceDiscrete: 是否使用离散信道估计（未在此版本使用）
+        """
+        self.otfs_data = otfs_data
+        self.indices = indices
+        self.n_samples = len(self.indices)
+
+        # 输入特征维度 = 2220个复数符号 × 2（实部+虚部）+ 16个信道参数
+        self.n_features = 2220 * 2 + 16
+        
+        # 输出标签维度 = 1920个复数符号 × 2（实部+虚部）
+        self.n_outputs = 1920 * 2
+
+        # 初始化特征矩阵X和标签矩阵Y
+        self.X = np.zeros((self.n_samples, self.n_features))
+        self.Y = np.zeros((self.n_samples, self.n_outputs))
+        
+        # 为每个样本构建特征和标签
+        for i, idx in enumerate(self.indices):
+            # 获取第idx个样本的接收信号
+            rx = otfs_data['Rx'][idx]
+            
+            # 提取信息符号部分（后2220个符号）
+            rx_info = rx[2220:]
+            
+            # 分离实部和虚部
+            rx_info_real = np.real(rx_info)
+            rx_info_imag = np.imag(rx_info)
+
+            # 将接收信号的实部和虚部合并作为前4440个特征
+            self.X[i, :4440] = np.hstack((rx_info_real, rx_info_imag))
+
+            # 如果没有提供信道估计模型，使用真实信道参数
+            if channelEstimationModel is None:
+                # 获取真实信道参数
+                chanParams = otfs_data['chanParamsData'][idx]
+                numPaths = chanParams[0]['numPaths'][0, 0][0, 0]
+                pathDelays = chanParams[0]['pathDelays'][0, 0][0]
+                pathGains = chanParams[0]['pathGains'][0, 0][0]
+                pathDopplers = chanParams[0]['pathDopplers'][0, 0][0]
+            
+                # 将信道参数填充到固定长度5（不足的补0）
+                pathDelays = np.pad(pathDelays, (0, 5 - len(pathDelays)))
+                pathGains = np.pad(pathGains, (0, 5 - len(pathGains)))
+                pathDopplers = np.pad(pathDopplers, (0, 5 - len(pathDopplers)))
+
+                # 将信道参数合并为最后16个特征
+                self.X[i, 4440:] = np.hstack((numPaths, pathDelays, pathGains, pathDopplers))
+                
+            # 构建标签（真实传输的符号）
+            # 获取第idx个样本的传输数据
+            tdata = otfs_data['Tdata'][:, :, idx]
+            
+            # 提取信息符号部分（跳过前30个导频符号）
+            tdata_info = tdata[:, 30:].reshape(-1)
+            
+            # 分离实部和虚部
+            tdata_info_real = np.real(tdata_info)
+            tdata_info_imag = np.imag(tdata_info)
+            
+            # 将真实符号的实部和虚部合并为标签
+            self.Y[i] = np.hstack((tdata_info_real, tdata_info_imag))
+
+        # 将numpy数组转换为PyTorch张量
+        self.X = torch.from_numpy(self.X).float()
+        self.Y = torch.from_numpy(self.Y).float()
+    
+    def __len__(self):
+        """返回数据集中样本的数量"""
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        """根据索引获取单个样本"""
+        return self.X[idx], self.Y[idx]
+
+# ============================================================================
+# MSE版本的神经网络结构
+# ============================================================================
+class SymbolDemodulationNetworkMSE(nn.Module):
+    def __init__(self, dropout_rate=0.0):
+        super(SymbolDemodulationNetworkMSE, self).__init__()
+
+        # 定义网络层
+        self.lin1 = nn.Linear(in_features=4456, out_features=3840)
+        self.lin2 = nn.Linear(in_features=3840, out_features=3840)
+        self.lin3 = nn.Linear(in_features=3840, out_features=3840)
+        self.lin4 = nn.Linear(in_features=3840, out_features=3840)
+        self.lin5 = nn.Linear(in_features=3840, out_features=3840)
+
+        # Dropout层
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.dropout3 = nn.Dropout(dropout_rate)
+        self.dropout4 = nn.Dropout(dropout_rate)
+
+        # 批归一化层
+        self.bn1 = nn.BatchNorm1d(3840)
+        self.bn2 = nn.BatchNorm1d(3840)
+        self.bn3 = nn.BatchNorm1d(3840)
+        self.bn4 = nn.BatchNorm1d(3840)
+
+    def forward(self, x):
+        # 前向传播
+        x = self.dropout1(F.relu(self.bn1(self.lin1(x))))
+        x = self.dropout2(F.relu(self.bn2(self.lin2(x))))
+        x = self.dropout3(F.relu(self.bn3(self.lin3(x))))
+        x = self.dropout4(F.relu(self.bn4(self.lin4(x))))
+        x = self.lin5(x)  # 最后一层没有激活函数，直接输出
+        return x
+
+# ============================================================================
+# MSE版本的训练函数
+# ============================================================================
+def train_model_mse(train_loader, test_loader, epochs=50, lr=1e-4, 
+                   optimizer_name='adam', dropout_rate=0.0, verbose=False):
+    """
+    训练MSE版本的符号解调模型
+    
+    参数:
+    - train_loader: 训练数据加载器
+    - test_loader: 测试数据加载器
+    - epochs: 训练轮数
+    - lr: 学习率
+    - optimizer_name: 优化器名称 ('adam', 'rmsprop', 'adagrad')
+    - dropout_rate: Dropout比率
+    - verbose: 是否打印详细信息
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if verbose:
+        print('Device =', device)
+
+    # 初始化模型
+    model = SymbolDemodulationNetworkMSE(dropout_rate)
+    model.to(device)
+
+    # 选择优化器
+    if optimizer_name.lower() == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_name.lower() == 'rmsprop':
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+    elif optimizer_name.lower() == 'adagrad':
+        optimizer = torch.optim.Adagrad(model.parameters(), lr=lr)
+    else:
+        raise ValueError(f'Optimizer not recognized: {optimizer_name}')
+
+    # 损失函数：均方误差
+    loss_fn_mse = nn.MSELoss()
+
+    # 记录训练过程中的损失
+    loss_train_means = []
+    loss_test_means = []
+    min_test_loss = float('inf')
+
+    # 训练循环
+    for epoch in range(epochs):
+        if verbose:
+            print(f'Epoch {epoch + 1}')
+
+        # 训练阶段
+        model.train()
+        loss_train = []
+        for batch in tqdm(train_loader, disable=not verbose):
+            X, Y = batch
+            X = X.to(device)
+            Y = Y.to(device)
+            
+            # 前向传播
+            Y_hat = model(X)
+            
+            # 计算损失
+            loss = loss_fn_mse(Y_hat, Y)
+            loss_train.append(loss.item())
+            
+            # 反向传播和优化
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # 测试阶段
+        model.eval()
+        loss_test = []
+        with torch.no_grad():
+            for batch in tqdm(test_loader, disable=not verbose):
+                X, Y = batch
+                X = X.to(device)
+                Y = Y.to(device)
+                
+                # 前向传播
+                Y_hat = model(X)
+                
+                # 计算损失
+                loss = loss_fn_mse(Y_hat, Y)
+                loss_test.append(loss.item())
+
+        # 计算平均损失
+        loss_train_mean = np.mean(loss_train)
+        loss_test_mean = np.mean(loss_test)
+        
+        loss_train_means.append(loss_train_mean)
+        loss_test_means.append(loss_test_mean)
+
+        if verbose:
+            print(f'Train Loss = {loss_train_mean:.6f}')
+            print(f'Test Loss = {loss_test_mean:.6f}')
+            
+        # 保存最佳模型
+        if loss_test_mean < min_test_loss:
+            min_test_loss = loss_test_mean
+            if verbose:
+                print(f'New min test loss = {min_test_loss:.6f}')
+            # 保存模型权重
+            save_path = BASE_PATH + f'model_weights/demod_mse_{lr}_{optimizer_name}_{dropout_rate}.pth'
+            torch.save(model.state_dict(), save_path)
+
+        if verbose:
+            print('-' * 80)
+
+    return loss_train_means, loss_test_means
+
+# ============================================================================
+# 主训练循环
+# ============================================================================
+if __name__ == "__main__":
+    # 定义超参数搜索空间
+    lrs = [1e-3, 1e-4, 1e-5]
+    optimizer_names = ['adam', 'rmsprop', 'adagrad']
+    dropout_rates = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+    
+    # 存储结果的字典
+    results_map = {}
+    
+    # 遍历所有超参数组合
+    for lr in lrs:
+        for optimizer_name in optimizer_names:
+            for dropout_rate in dropout_rates:
+                # 创建数据集和数据加载器
+                dataset_train = SymbolDemodulationDatasetMSE(otfs_data, train_indices)
+                train_loader = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True)
+                
+                dataset_test = SymbolDemodulationDatasetMSE(otfs_data, test_indices)
+                test_loader = DataLoader(dataset_test, batch_size=BATCH_SIZE)
+                
+                # 训练模型
+                print(f"Training with lr={lr}, optimizer={optimizer_name}, dropout={dropout_rate}")
+                train_losses, test_losses = train_model_mse(
+                    train_loader, test_loader, 
+                    epochs=EPOCHS, lr=lr, 
+                    optimizer_name=optimizer_name, 
+                    dropout_rate=dropout_rate, 
+                    verbose=True
+                )
+                
+                # 保存结果
+                key = (lr, optimizer_name, dropout_rate)
+                results_map[key] = {
+                    'train_losses': train_losses,
+                    'test_losses': test_losses,
+                    'final_train_loss': train_losses[-1],
+                    'final_test_loss': test_losses[-1]
+                }
+                
+                print(f"Completed training for {key}")
+                print("=" * 80)
